@@ -1,5 +1,4 @@
-lexer.h : 
-#ifndef EAZYSHELL_LEXER_H
+ #ifndef EAZYSHELL_LEXER_H
 #define EAZYSHELL_LEXER_H
 
 #include <stddef.h>
