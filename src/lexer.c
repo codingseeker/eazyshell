@@ -1,136 +1,342 @@
-#define _GNU_SOURCE
+lexer.c #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include "lexer.h"
-#include "expansion.h"
 
-#define MAX_TOKENS 256
-#define MAX_VAR_NAME 256
+#define INIT_TOKEN_CAP 32
+#define MAX_SUBSHELL_DEPTH 64
+
+static int is_operator_char(char c) {
+    return strchr("|&;<>()", c) != NULL;
+}
+
+static void ensure_capacity(Token **tokens, int *cap, int idx, int need) {
+    if (idx + need > *cap) {
+        while (idx + need > *cap) *cap *= 2;
+        *tokens = realloc(*tokens, sizeof(Token) * (*cap));
+        if (!*tokens) { perror("realloc"); exit(1); }
+    }
+}
+
+static void lex_error(const char *line, int col, const char *msg) {
+    fprintf(stderr, "lex error at column %d: %s\n", col, msg);
+    exit(1);
+}
+
+static char *read_variable_name(const char *start, const char **endp) {
+    const char *p = start;
+    if (isdigit(*p)) {
+        p++;
+    } else if (isalpha(*p) || *p == '_') {
+        p++;
+        while (isalnum(*p) || *p == '_') p++;
+    } else if (*p == '?' || *p == '$' || *p == '!' || *p == '*' || *p == '@') {
+        p++;
+    } else {
+        return NULL;
+    }
+    *endp = p;
+    return strndup(start, p - start);
+}
+
+static char *read_braced_variable(const char *start, const char **endp, int *error) {
+    const char *p = start;
+    if (*p != '{') return NULL;
+    p++;
+    const char *var_start = p;
+    int depth = 1;
+    while (*p) {
+        if (*p == '{') depth++;
+        else if (*p == '}') {
+            depth--;
+            if (depth == 0) break;
+        }
+        p++;
+    }
+    if (depth != 0) {
+        *error = 1;
+        return NULL;
+    }
+    *endp = p + 1;
+    return strndup(var_start, p - var_start);
+}
+
+static char *read_word(const char *line, int *pos, int line_len, int *col, int *quoted) {
+    int in_squote = 0, in_dquote = 0;
+    int escaped = 0;
+    *quoted = 0;
+    size_t cap = 16, len = 0;
+    char *word = malloc(cap);
+    if (!word) { perror("malloc"); exit(1); }
+    while (*pos < line_len) {
+        char c = line[*pos];
+        if (escaped) {
+            if (len + 1 >= cap) { cap *= 2; word = realloc(word, cap); if (!word) { perror("realloc"); exit(1); } }
+            word[len++] = c;
+            escaped = 0;
+            (*pos)++;
+            (*col)++;
+            continue;
+        }
+        if (c == '\\' && !in_squote) {
+            escaped = 1;
+            (*pos)++;
+            (*col)++;
+            continue;
+        }
+        if (c == '\'' && !in_dquote) {
+            in_squote = !in_squote;
+            *quoted = 1;
+            (*pos)++;
+            (*col)++;
+            continue;
+        }
+        if (c == '"' && !in_squote) {
+            in_dquote = !in_dquote;
+            *quoted = 1;
+            (*pos)++;
+            (*col)++;
+            continue;
+        }
+        if (!in_squote && !in_dquote) {
+            if (is_operator_char(c) || c == ' ' || c == '\t')
+                break;
+            if (c == '$' && (*pos + 1 < line_len)) {
+                char n = line[*pos + 1];
+                if (n == '(' || n == '{' || isalpha(n) || n == '_' || n == '?' || n == '$' || n == '!' || n == '*' || n == '@' || isdigit(n))
+                    break;
+            }
+        }
+        if (len + 1 >= cap) { cap *= 2; word = realloc(word, cap); if (!word) { perror("realloc"); exit(1); } }
+        word[len++] = c;
+        (*pos)++;
+        (*col)++;
+    }
+    if (in_squote || in_dquote) {
+        free(word);
+        return NULL;
+    }
+    if (escaped) {
+        free(word);
+        return NULL;
+    }
+    word[len] = '\0';
+    return word;
+}
+
+static Token *tokenize_internal(char *line, int depth, int *ntok);
 
 Token *tokenize(char *line, int *ntok) {
-    Token *tokens = malloc(sizeof(Token) * MAX_TOKENS);
+    return tokenize_internal(line, 0, ntok);
+}
+
+static Token *tokenize_internal(char *line, int depth, int *ntok) {
+    int cap = INIT_TOKEN_CAP;
+    Token *tokens = malloc(sizeof(Token) * cap);
     if (!tokens) { perror("malloc"); exit(1); }
     int i = 0;
-    char *p = line;
-    while (*p) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) break;
-        if (*p == '|' && *(p+1) == '|') {
-            tokens[i].type = TOKEN_OR;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p += 2;
-        } else if (*p == '|') {
-            tokens[i].type = TOKEN_PIPE;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == '&' && *(p+1) == '&') {
-            tokens[i].type = TOKEN_AND;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p += 2;
-        } else if (*p == ';') {
-            tokens[i].type = TOKEN_SEMICOLON;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == '<' && *(p+1) == '<') {
-            tokens[i].type = TOKEN_REDIR_HEREDOC;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p += 2;
-        } else if (*p == '<') {
-            tokens[i].type = TOKEN_REDIR_IN;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == '>') {
-            tokens[i].type = TOKEN_REDIR_OUT;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == '&' && (*(p+1) == ' ' || *(p+1) == '\0' || *(p+1) == '\t')) {
-            tokens[i].type = TOKEN_BACKGROUND;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == '$' && *(p+1) == '(' && *(p+2) == '(') {
-            p += 3;
-            char *start = p;
-            int depth = 1;
-            while (*p) {
-                if (*p == '(' && *(p+1) == '(') { depth++; p += 2; }
-                else if (*p == ')' && *(p+1) == ')') {
-                    depth--;
-                    if (depth == 0) break;
-                    p += 2;
-                } else p++;
-            }
-            char *expr = strndup(start, p - start);
-            tokens[i].type = TOKEN_ARITH;
-            tokens[i].value = expr;
-            tokens[i].quoted = 0;
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '(') {
-            tokens[i].type = TOKEN_SUBSHELL_OPEN;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p += 2;
-        } else if (*p == '(') {
-            tokens[i].type = TOKEN_GROUP_OPEN;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else if (*p == ')') {
-            tokens[i].type = TOKEN_GROUP_CLOSE;
-            tokens[i].value = NULL;
-            tokens[i].quoted = 0;
-            p++;
-        } else {
-            char *start = p;
-            int in_squote = 0, in_dquote = 0;
-            int escaped = 0;
-            int quoted = 0;
-            while (*p) {
-                if (escaped) { escaped = 0; p++; continue; }
-                if (*p == '\\' && !in_squote) { escaped = 1; p++; continue; }
-                if (*p == '\'' && !in_dquote) { in_squote = !in_squote; quoted = 1; p++; continue; }
-                if (*p == '"' && !in_squote) { in_dquote = !in_dquote; quoted = 1; p++; continue; }
-                if (!in_squote && !in_dquote) {
-                    if (strchr(" \t|&;<>()", *p)) break;
-                    if (*p == '$' && (*(p+1) == '(' || (isalpha(*(p+1)) || *(p+1) == '_' || *(p+1) == '{'))) break;
-                }
-                p++;
-            }
-            char *word = strndup(start, p - start);
-            if (!in_squote && !in_dquote) {
-                char *eq = strchr(word, '=');
-                if (eq && eq != word && (isalpha(word[0]) || word[0] == '_')) {
-                    int valid = 1;
-                    for (char *c = word; c < eq; c++) {
-                        if (!isalnum(*c) && *c != '_') { valid = 0; break; }
-                    }
-                    if (valid) {
-                        tokens[i].type = TOKEN_ASSIGNMENT;
-                        tokens[i].value = word;
-                        tokens[i].quoted = quoted;
-                        i++;
-                        if (i >= MAX_TOKENS) break;
-                        continue;
-                    }
-                }
-            }
-            char *expanded = expand_param(word);
-            tokens[i].type = TOKEN_WORD;
-            tokens[i].value = expanded;
-            tokens[i].quoted = quoted;
-            free(word);
+    int pos = 0;
+    int col = 1;
+    int line_len = strlen(line);
+    while (pos < line_len) {
+        char c = line[pos];
+        if (c == ' ' || c == '\t') {
+            pos++;
+            col++;
+            continue;
         }
-        i++;
-        if (i >= MAX_TOKENS) break;
+        if (c == '#' && (pos == 0 || line[pos-1] == ' ' || line[pos-1] == '\t')) {
+            break;
+        }
+        char c1 = (pos + 1 < line_len) ? line[pos + 1] : 0;
+        if (c == '|' && c1 == '|') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_OR, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == '|') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_PIPE, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '&' && c1 == '&') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_AND, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == ';') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_SEMICOLON, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '&' && c1 == '>') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_BOTH_OUT, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == '>' && c1 == '>') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_APPEND, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == '>' && c1 == '|') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_CLOBBER, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == '<' && c1 == '<' && pos + 2 < line_len && line[pos+2] == '-') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_HEREDOC_TAB, .value = NULL, .quoted = 0 };
+            pos += 3; col += 3;
+            continue;
+        }
+        if (c == '<' && c1 == '<') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_HEREDOC, .value = NULL, .quoted = 0 };
+            pos += 2; col += 2;
+            continue;
+        }
+        if (c == '<') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_IN, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '>') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_REDIR_OUT, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '&' && c1 != '&') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_BACKGROUND, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '$' && c1 == '(' && pos + 2 < line_len && line[pos+2] == '(') {
+            pos += 3; col += 3;
+            const char *start = line + pos;
+            int paren_depth = 2;
+            while (pos < line_len) {
+                char c = line[pos];
+                if (c == '(') paren_depth++;
+                else if (c == ')') paren_depth--;
+                if (paren_depth == 0) break;
+                pos++; col++;
+            }
+            if (paren_depth != 0) {
+                for (int j = 0; j < i; j++) free(tokens[j].value);
+                free(tokens);
+                lex_error(line, col, "unfinished $(( expression");
+            }
+            char *expr = strndup(start, line + pos - start);
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_ARITH, .value = expr, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == '$' && c1 == '(') {
+            if (++depth > MAX_SUBSHELL_DEPTH) {
+                for (int j = 0; j < i; j++) free(tokens[j].value);
+                free(tokens);
+                lex_error(line, col, "subshell nesting too deep");
+            }
+            pos += 2; col += 2;
+            const char *start = line + pos;
+            int paren_depth = 1;
+            while (pos < line_len) {
+                char c = line[pos];
+                if (c == '(') paren_depth++;
+                else if (c == ')') paren_depth--;
+                if (paren_depth == 0) break;
+                pos++; col++;
+            }
+            if (paren_depth != 0) {
+                depth--;
+                for (int j = 0; j < i; j++) free(tokens[j].value);
+                free(tokens);
+                lex_error(line, col, "unfinished $(");
+            }
+            int inner_len = line + pos - start;
+            char *inner = strndup(start, inner_len);
+            int inner_ntok;
+            Token *inner_tokens = tokenize_internal(inner, depth, &inner_ntok);
+            free(inner);
+            ensure_capacity(&tokens, &cap, i, 1 + inner_ntok + 1);
+            tokens[i++] = (Token){ .type = TOKEN_SUBSHELL_OPEN, .value = NULL, .quoted = 0 };
+            for (int j = 0; j < inner_ntok; j++) {
+                tokens[i++] = inner_tokens[j];
+            }
+            free(inner_tokens);
+            tokens[i++] = (Token){ .type = TOKEN_SUBSHELL_CLOSE, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            depth--;
+            continue;
+        }
+        if (c == '$' && (c1 == '{' || isalpha(c1) || c1 == '_' || c1 == '?' || c1 == '$' || c1 == '!' || c1 == '*' || c1 == '@' || isdigit(c1))) {
+            if (c1 == '{') {
+                const char *start = line + pos + 2;
+                int error = 0;
+                const char *end;
+                char *var = read_braced_variable(start, &end, &error);
+                if (error) {
+                    for (int j = 0; j < i; j++) free(tokens[j].value);
+                    free(tokens);
+                    lex_error(line, col, "unclosed ${");
+                }
+                ensure_capacity(&tokens, &cap, i, 1);
+                tokens[i++] = (Token){ .type = TOKEN_VAR_BRACE, .value = var, .quoted = 0 };
+                int consumed = end - line;
+                col += (consumed - pos);
+                pos = consumed;
+            } else {
+                const char *start = line + pos + 1;
+                const char *end;
+                char *var = read_variable_name(start, &end);
+                if (!var) {
+                    for (int j = 0; j < i; j++) free(tokens[j].value);
+                    free(tokens);
+                    lex_error(line, col, "invalid variable name");
+                }
+                ensure_capacity(&tokens, &cap, i, 1);
+                tokens[i++] = (Token){ .type = TOKEN_VAR, .value = var, .quoted = 0 };
+                int consumed = end - line;
+                col += (consumed - pos);
+                pos = consumed;
+            }
+            continue;
+        }
+        if (c == '(') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_GROUP_OPEN, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        if (c == ')') {
+            ensure_capacity(&tokens, &cap, i, 1);
+            tokens[i++] = (Token){ .type = TOKEN_GROUP_CLOSE, .value = NULL, .quoted = 0 };
+            pos++; col++;
+            continue;
+        }
+        int quoted;
+        char *word = read_word(line, &pos, line_len, &col, &quoted);
+        if (!word) {
+            for (int j = 0; j < i; j++) free(tokens[j].value);
+            free(tokens);
+            lex_error(line, col, "unclosed quote or trailing escape");
+        }
+        ensure_capacity(&tokens, &cap, i, 1);
+        tokens[i++] = (Token){ .type = TOKEN_WORD, .value = word, .quoted = quoted };
     }
     *ntok = i;
     return tokens;
