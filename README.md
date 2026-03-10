@@ -1,19 +1,13 @@
 eazyshell
 
-eazyshell is a small shell written in C as a learning project. The goal of this project is to understand how Unix shells work internally by implementing basic components such as lexical analysis, parsing, command execution, and job control.
+eazyshell is a small shell written in C as a learning project. The goal of this project is to run Unix shells work internally by implementing basic components such as lexical analysis, parsing, command execution, and job control.
 
-This project is intended as a systems programming exercise for learning concepts related to operating systems, process management, and command interpreters.
+This project is intended as a  application for learning concepts related to operating systems, process management, and command interpreters.
 
 Objectives
 
 The main objectives of this project are:
-
-- Learn how a command line shell works
-- Practice modular programming in C
-- Understand process creation and execution using system calls
-- Implement command parsing and execution
-- Gain experience with building and organizing a medium-sized C project
-
+-to implement a new easy to use shell script with modern features
 Project Structure
 
 The project is organized into two main directories: "include" and "src".
