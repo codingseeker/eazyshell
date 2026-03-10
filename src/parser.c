@@ -1,349 +1,427 @@
-#define _GNU_SOURCE
+parser.c#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <glob.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include "parser.h"
-#include "expansion.h"
-#include "executor.h"   // for eval_ast in command substitution
+#include "AST.h"
 
-#define MAX_CMDS 16
 #define INIT_ARGV_CAP 8
+#define MAX_PIPE_CMDS 1024
+#define MAX_PARSE_DEPTH 256
 
+static const char *token_str_at(Token *tokens, int pos, int end) {
+    return (pos < end && tokens[pos].value) ? tokens[pos].value : "EOF";
+}
+
+static int is_command_terminator(TokenType t) {
+    return t == TOKEN_PIPE ||
+           t == TOKEN_AND ||
+           t == TOKEN_OR ||
+           t == TOKEN_SEMICOLON ||
+           t == TOKEN_GROUP_CLOSE ||
+           t == TOKEN_SUBSHELL_CLOSE ||
+           t == TOKEN_THEN ||
+           t == TOKEN_DO ||
+           t == TOKEN_ELSE ||
+           t == TOKEN_FI ||
+           t == TOKEN_DONE;
+}
+
+static char *expect_word(Token *tokens, int *pos, int end) {
+    if (*pos >= end || tokens[*pos].type != TOKEN_WORD) {
+        fprintf(stderr, "parse error near token '%s': expected word\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+    char *word = strdup(tokens[*pos].value);
+    if (!word) { perror("strdup"); exit(1); }
+    (*pos)++;
+    return word;
+}
+
+static int command_is_empty(Command *cmd) {
+    return cmd->argc == 0 && cmd->env_count == 0 &&
+           !cmd->infile && !cmd->outfile && !cmd->heredoc_delim;
+}
+
+static ASTNode *parse_component(Token *tokens, int *pos, int end, int depth);
 static Command *parse_command(Token *tokens, int *pos, int end);
-static ASTNode *parse_pipeline(Token *tokens, int *pos, int end);
-static ASTNode *parse_if(Token *tokens, int *pos, int end);
-static ASTNode *parse_while(Token *tokens, int *pos, int end);
-static ASTNode *parse_for(Token *tokens, int *pos, int end);
-static ASTNode *parse_group(Token *tokens, int *pos, int end);
+static ASTNode *parse_pipeline(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_if(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_while(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_for(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_group(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_subshell(Token *tokens, int *pos, int end, int depth);
+static ASTNode *parse_secondary(Token *tokens, int *pos, int end, int depth);
 
 static Command *parse_command(Token *tokens, int *pos, int end) {
-    Command *cmd = malloc(sizeof(Command));
-    if (!cmd) { perror("malloc"); exit(1); }
-    cmd->argv = malloc(sizeof(char*) * INIT_ARGV_CAP);
-    if (!cmd->argv) { perror("malloc"); exit(1); }
-    cmd->argc = 0;
-    cmd->argv_cap = INIT_ARGV_CAP;
-    cmd->infile = NULL;
-    cmd->outfile = NULL;
-    cmd->heredoc_delim = NULL;
-    cmd->heredoc_fd = -1;
+    Command *cmd = new_command();
+    if (!cmd) { perror("new_command"); exit(1); }
+
     while (*pos < end) {
+        TokenType type = tokens[*pos].type;
+        if (is_command_terminator(type)) break;
+
         Token t = tokens[*pos];
-        if (t.type == TOKEN_WORD) {
-            int bcount;
-            char **bwords = expand_braces(t.value, &bcount);
-            for (int bi = 0; bi < bcount; bi++) {
-                if (!t.quoted) {
-                    int splitcount;
-                    char **split = split_words(bwords[bi], &splitcount);
-                    for (int si = 0; si < splitcount; si++) {
-                        if (cmd->argc >= cmd->argv_cap) {
-                            cmd->argv_cap *= 2;
-                            cmd->argv = realloc(cmd->argv, sizeof(char*) * cmd->argv_cap);
-                            if (!cmd->argv) { perror("realloc"); exit(1); }
-                        }
-                        glob_t globbuf;
-                        int ret = glob(split[si], GLOB_NOCHECK | GLOB_TILDE, NULL, &globbuf);
-                        if (ret == 0) {
-                            for (size_t g = 0; g < globbuf.gl_pathc; g++) {
-                                cmd->argv[cmd->argc++] = strdup(globbuf.gl_pathv[g]);
-                            }
-                        }
-                        globfree(&globbuf);
-                        free(split[si]);
-                    }
-                    free(split);
-                } else {
-                    if (cmd->argc >= cmd->argv_cap) {
-                        cmd->argv_cap *= 2;
-                        cmd->argv = realloc(cmd->argv, sizeof(char*) * cmd->argv_cap);
-                        if (!cmd->argv) { perror("realloc"); exit(1); }
-                    }
-                    glob_t globbuf;
-                    int ret = glob(bwords[bi], GLOB_NOCHECK | GLOB_TILDE, NULL, &globbuf);
-                    if (ret == 0) {
-                        for (size_t g = 0; g < globbuf.gl_pathc; g++) {
-                            cmd->argv[cmd->argc++] = strdup(globbuf.gl_pathv[g]);
-                        }
-                    }
-                    globfree(&globbuf);
+
+        switch (type) {
+            case TOKEN_WORD:
+            case TOKEN_ARITH:
+                if (cmd->argc + 1 >= cmd->argv_cap) {
+                    size_t new_cap = cmd->argv_cap ? cmd->argv_cap * 2 : INIT_ARGV_CAP;
+                    char **new_argv = realloc(cmd->argv, sizeof(char*) * new_cap);
+                    if (!new_argv) { perror("realloc"); exit(1); }
+                    cmd->argv = new_argv;
+                    cmd->argv_cap = new_cap;
                 }
-                free(bwords[bi]);
+                cmd->argv[cmd->argc] = strdup(t.value);
+                if (!cmd->argv[cmd->argc]) { perror("strdup"); exit(1); }
+                cmd->argc++;
+                cmd->argv[cmd->argc] = NULL;
+                (*pos)++;
+                break;
+
+            case TOKEN_ASSIGNMENT: {
+                char **new_env = realloc(cmd->env_assigns,
+                                         sizeof(char*) * (cmd->env_count + 1));
+                if (!new_env) { perror("realloc"); exit(1); }
+                cmd->env_assigns = new_env;
+                cmd->env_assigns[cmd->env_count] = strdup(t.value);
+                if (!cmd->env_assigns[cmd->env_count]) { perror("strdup"); exit(1); }
+                cmd->env_count++;
+                (*pos)++;
+                break;
             }
-            free(bwords);
-            (*pos)++;
-        } else if (t.type == TOKEN_ARITH) {
-            long res = eval_arith_expr(t.value);
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%ld", res);
-            if (cmd->argc >= cmd->argv_cap) {
-                cmd->argv_cap *= 2;
-                cmd->argv = realloc(cmd->argv, sizeof(char*) * cmd->argv_cap);
-                if (!cmd->argv) { perror("realloc"); exit(1); }
-            }
-            cmd->argv[cmd->argc++] = strdup(buf);
-            (*pos)++;
-        } else if (t.type == TOKEN_REDIR_IN) {
-            (*pos)++;
-            if (*pos < end && tokens[*pos].type == TOKEN_WORD) {
+
+            case TOKEN_REDIR_IN:
+                (*pos)++;
                 if (cmd->infile) free(cmd->infile);
-                cmd->infile = strdup(tokens[*pos].value);
-            }
-            (*pos)++;
-        } else if (t.type == TOKEN_REDIR_OUT) {
-            (*pos)++;
-            if (*pos < end && tokens[*pos].type == TOKEN_WORD) {
+                cmd->infile = expect_word(tokens, pos, end);
+                break;
+
+            case TOKEN_REDIR_OUT:
+                (*pos)++;
                 if (cmd->outfile) free(cmd->outfile);
-                cmd->outfile = strdup(tokens[*pos].value);
-            }
-            (*pos)++;
-        } else if (t.type == TOKEN_REDIR_HEREDOC) {
-            (*pos)++;
-            if (*pos < end && tokens[*pos].type == TOKEN_WORD) {
+                cmd->outfile = expect_word(tokens, pos, end);
+                cmd->append_out = 0;
+                break;
+
+            case TOKEN_REDIR_APPEND:
+                (*pos)++;
+                if (cmd->outfile) free(cmd->outfile);
+                cmd->outfile = expect_word(tokens, pos, end);
+                cmd->append_out = 1;
+                break;
+
+            case TOKEN_REDIR_HEREDOC:
+                (*pos)++;
                 if (cmd->heredoc_delim) free(cmd->heredoc_delim);
-                cmd->heredoc_delim = strdup(tokens[*pos].value);
-                char *delim = cmd->heredoc_delim;
-                char *line = NULL;
-                size_t len = 0;
-                FILE *fp = tmpfile();
-                if (!fp) { perror("tmpfile"); exit(1); }
-                int fd = fileno(fp);
-                cmd->heredoc_fd = fd;
-                while (getline(&line, &len, stdin) != -1) {
-                    line[strcspn(line, "\n")] = '\0';
-                    if (strcmp(line, delim) == 0) break;
-                    write(fd, line, strlen(line));
-                    write(fd, "\n", 1);
-                }
-                free(line);
-                lseek(fd, 0, SEEK_SET);
-            }
-            (*pos)++;
-        } else if (t.type == TOKEN_ASSIGNMENT) {
-            char *eq = strchr(t.value, '=');
-            *eq = '\0';
-            setenv(t.value, eq+1, 1);
-            free_token(&t);
-            (*pos)++;
-        } else if (t.type == TOKEN_SUBSHELL_OPEN) {
-            (*pos)++;
-            int sub_end = *pos;
-            int depth = 1;
-            while (sub_end < end) {
-                if (tokens[sub_end].type == TOKEN_SUBSHELL_OPEN) depth++;
-                else if (tokens[sub_end].type == TOKEN_SUBSHELL_CLOSE) {
-                    depth--;
-                    if (depth == 0) break;
-                }
-                sub_end++;
-            }
-            int sub_pos = *pos;
-            ASTNode *sub_ast = parse_toplevel(tokens, &sub_pos, sub_end);
-            int pipefd[2];
-            if (pipe(pipefd) < 0) { perror("pipe"); exit(1); }
-            pid_t pid = fork();
-            if (pid < 0) { perror("fork"); exit(1); }
-            if (pid == 0) {
-                close(pipefd[0]);
-                dup2(pipefd[1], STDOUT_FILENO);
-                close(pipefd[1]);
-                eval_ast(sub_ast, 0, 0);
-                exit(0);
-            } else {
-                close(pipefd[1]);
-                char buf[1024];
-                ssize_t n;
-                char *output = malloc(1);
-                if (!output) { perror("malloc"); exit(1); }
-                output[0] = '\0';
-                while ((n = read(pipefd[0], buf, sizeof(buf)-1)) > 0) {
-                    buf[n] = '\0';
-                    output = realloc(output, strlen(output)+n+1);
-                    if (!output) { perror("realloc"); exit(1); }
-                    strcat(output, buf);
-                }
-                waitpid(pid, NULL, 0);
-                close(pipefd[0]);
-                output[strcspn(output, "\n")] = '\0';
-                int splitcount;
-                char **split = split_words(output, &splitcount);
-                for (int si = 0; si < splitcount; si++) {
-                    if (cmd->argc >= cmd->argv_cap) {
-                        cmd->argv_cap *= 2;
-                        cmd->argv = realloc(cmd->argv, sizeof(char*) * cmd->argv_cap);
-                        if (!cmd->argv) { perror("realloc"); exit(1); }
-                    }
-                    cmd->argv[cmd->argc++] = split[si];
-                }
-                free(split);
-                free(output);
-                free_ast(sub_ast);
-                *pos = sub_end + 1;
-            }
-        } else {
-            break;
+                cmd->heredoc_delim = expect_word(tokens, pos, end);
+                break;
+
+            default:
+                goto done;
         }
     }
-    cmd->argv[cmd->argc] = NULL;
+
+done:
     return cmd;
 }
 
-static ASTNode *parse_pipeline(Token *tokens, int *pos, int end) {
-    Pipeline *p = malloc(sizeof(Pipeline));
-    if (!p) { perror("malloc"); exit(1); }
-    p->cmds = malloc(sizeof(Command*) * MAX_CMDS);
-    if (!p->cmds) { perror("malloc"); exit(1); }
-    p->count = 0;
-    p->cmds[p->count++] = parse_command(tokens, pos, end);
-    while (*pos < end && tokens[*pos].type == TOKEN_PIPE) {
-        (*pos)++;
-        if (p->count >= MAX_CMDS) {
-            fprintf(stderr, "pipeline too long\n");
-            break;
-        }
-        p->cmds[p->count++] = parse_command(tokens, pos, end);
+static ASTNode *parse_secondary(Token *tokens, int *pos, int end, int depth) {
+    TokenType next = tokens[*pos].type;
+    if (next == TOKEN_IF) {
+        return parse_if(tokens, pos, end, depth);
+    } else if (next == TOKEN_WHILE) {
+        return parse_while(tokens, pos, end, depth);
+    } else if (next == TOKEN_FOR) {
+        return parse_for(tokens, pos, end, depth);
+    } else {
+        return parse_pipeline(tokens, pos, end, depth);
     }
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = NODE_PIPELINE;
-    node->data.pipeline = p;
+}
+
+static ASTNode *parse_component(Token *tokens, int *pos, int end, int depth) {
+    if (*pos >= end) return NULL;
+
+    TokenType type = tokens[*pos].type;
+    switch (type) {
+        case TOKEN_IF:          return parse_if(tokens, pos, end, depth);
+        case TOKEN_WHILE:       return parse_while(tokens, pos, end, depth);
+        case TOKEN_FOR:         return parse_for(tokens, pos, end, depth);
+        case TOKEN_SUBSHELL_OPEN: return parse_subshell(tokens, pos, end, depth);
+        case TOKEN_GROUP_OPEN:  return parse_group(tokens, pos, end, depth);
+        default: {
+            Command *cmd = parse_command(tokens, pos, end);
+            if (command_is_empty(cmd)) {
+                free_command(cmd);
+                fprintf(stderr, "parse error near token '%s': empty command\n",
+                        token_str_at(tokens, *pos, end));
+                exit(1);
+            }
+            ASTNode *node = new_command_node(cmd);
+            if (!node) { perror("new_command_node"); exit(1); }
+            return node;
+        }
+    }
+}
+
+static ASTNode *parse_pipeline(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+
+    ASTNode *first = parse_component(tokens, pos, end, depth + 1);
+    if (!first) return NULL;
+
+    if (*pos >= end || tokens[*pos].type != TOKEN_PIPE) {
+        return first;
+    }
+
+    Pipeline *p = new_pipeline();
+    if (!p) { perror("new_pipeline"); exit(1); }
+
+    size_t cap = 4;
+    p->nodes = malloc(sizeof(ASTNode*) * cap);
+    if (!p->nodes) { perror("malloc"); exit(1); }
+    p->count = 0;
+    p->nodes[p->count++] = first;
+
+    while (*pos < end && tokens[*pos].type == TOKEN_PIPE) {
+        if (p->count >= MAX_PIPE_CMDS) {
+            fprintf(stderr, "parse error near token '%s': pipeline too long\n",
+                    token_str_at(tokens, *pos, end));
+            exit(1);
+        }
+        (*pos)++;
+        ASTNode *next = parse_component(tokens, pos, end, depth + 1);
+        if (!next) {
+            fprintf(stderr, "parse error near token '%s': expected command after pipe\n",
+                    token_str_at(tokens, *pos, end));
+            exit(1);
+        }
+        if (p->count >= cap) {
+            cap *= 2;
+            ASTNode **new_nodes = realloc(p->nodes, sizeof(ASTNode*) * cap);
+            if (!new_nodes) { perror("realloc"); exit(1); }
+            p->nodes = new_nodes;
+        }
+        p->nodes[p->count++] = next;
+    }
+
+    ASTNode *node = new_pipeline_node(p);
+    if (!node) { perror("new_pipeline_node"); exit(1); }
     return node;
 }
 
-static ASTNode *parse_if(Token *tokens, int *pos, int end) {
-    (*pos)++;
-    ASTNode *cond = parse_toplevel(tokens, pos, end);
-    if (*pos >= end || tokens[*pos].type != TOKEN_THEN) {
-        fprintf(stderr, "parse error: expected 'then'\n");
+static ASTNode *parse_subshell(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *then_body = parse_toplevel(tokens, pos, end);
+    int sub_start = *pos;
+    int depth_count = 1;
+    int sub_end = sub_start;
+
+    while (sub_end < end) {
+        if (tokens[sub_end].type == TOKEN_SUBSHELL_OPEN) depth_count++;
+        else if (tokens[sub_end].type == TOKEN_SUBSHELL_CLOSE) {
+            depth_count--;
+            if (depth_count == 0) break;
+        }
+        sub_end++;
+    }
+    if (sub_end >= end || tokens[sub_end].type != TOKEN_SUBSHELL_CLOSE) {
+        fprintf(stderr, "parse error near token '%s': missing ')'\n",
+                token_str_at(tokens, sub_end, end));
+        exit(1);
+    }
+
+    int inner_pos = sub_start;
+    ASTNode *inner = parse_toplevel(tokens, &inner_pos, sub_end, depth + 1);
+    if (inner_pos != sub_end) {
+        fprintf(stderr, "parse error near token '%s': garbage at end of subshell\n",
+                token_str_at(tokens, inner_pos, end));
+        exit(1);
+    }
+    *pos = sub_end + 1;
+
+    ASTNode *node = new_subshell_node(inner);
+    if (!node) { perror("new_subshell_node"); exit(1); }
+    return node;
+}
+
+static ASTNode *parse_group(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+    (*pos)++;
+    ASTNode *body = parse_toplevel(tokens, pos, end, depth + 1);
+    if (*pos >= end || tokens[*pos].type != TOKEN_GROUP_CLOSE) {
+        fprintf(stderr, "parse error near token '%s': expected ')'\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+    (*pos)++;
+    ASTNode *node = new_group_node(body);
+    if (!node) { perror("new_group_node"); exit(1); }
+    return node;
+}
+
+static ASTNode *parse_if(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+    (*pos)++;
+    ASTNode *cond = parse_toplevel(tokens, pos, end, depth + 1);
+    if (*pos >= end || tokens[*pos].type != TOKEN_THEN) {
+        fprintf(stderr, "parse error near token '%s': expected 'then'\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
+    (*pos)++;
+    ASTNode *then_body = parse_toplevel(tokens, pos, end, depth + 1);
     ASTNode *else_body = NULL;
     if (*pos < end && tokens[*pos].type == TOKEN_ELSE) {
         (*pos)++;
-        else_body = parse_toplevel(tokens, pos, end);
+        else_body = parse_toplevel(tokens, pos, end, depth + 1);
     }
     if (*pos >= end || tokens[*pos].type != TOKEN_FI) {
-        fprintf(stderr, "parse error: expected 'fi'\n");
+        fprintf(stderr, "parse error near token '%s': expected 'fi'\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = NODE_IF;
-    node->data.if_stmt.condition = cond;
-    node->data.if_stmt.then_body = then_body;
-    node->data.if_stmt.else_body = else_body;
+    ASTNode *node = new_if_node(cond, then_body, else_body);
+    if (!node) { perror("new_if_node"); exit(1); }
     return node;
 }
 
-static ASTNode *parse_while(Token *tokens, int *pos, int end) {
+static ASTNode *parse_while(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
     (*pos)++;
-    ASTNode *cond = parse_toplevel(tokens, pos, end);
+    ASTNode *cond = parse_toplevel(tokens, pos, end, depth + 1);
     if (*pos >= end || tokens[*pos].type != TOKEN_DO) {
-        fprintf(stderr, "parse error: expected 'do'\n");
+        fprintf(stderr, "parse error near token '%s': expected 'do'\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *body = parse_toplevel(tokens, pos, end);
+    ASTNode *body = parse_toplevel(tokens, pos, end, depth + 1);
     if (*pos >= end || tokens[*pos].type != TOKEN_DONE) {
-        fprintf(stderr, "parse error: expected 'done'\n");
+        fprintf(stderr, "parse error near token '%s': expected 'done'\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = NODE_WHILE;
-    node->data.while_stmt.condition = cond;
-    node->data.while_stmt.body = body;
+    ASTNode *node = new_while_node(cond, body);
+    if (!node) { perror("new_while_node"); exit(1); }
     return node;
 }
 
-static ASTNode *parse_for(Token *tokens, int *pos, int end) {
+static ASTNode *parse_for(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
+        exit(1);
+    }
     (*pos)++;
     if (*pos >= end || tokens[*pos].type != TOKEN_WORD) {
-        fprintf(stderr, "parse error: expected variable name\n");
+        fprintf(stderr, "parse error near token '%s': expected variable name\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     char *var = strdup(tokens[*pos].value);
+    if (!var) { perror("strdup"); exit(1); }
     (*pos)++;
+
     char **wordlist = NULL;
-    int wordcount = 0;
+    size_t wordcount = 0;
     if (*pos < end && tokens[*pos].type == TOKEN_IN) {
         (*pos)++;
         while (*pos < end && tokens[*pos].type == TOKEN_WORD) {
-            wordlist = realloc(wordlist, sizeof(char*) * (wordcount+1));
-            wordlist[wordcount++] = strdup(tokens[*pos].value);
+            char **new_wl = realloc(wordlist, sizeof(char*) * (wordcount + 1));
+            if (!new_wl) { perror("realloc"); exit(1); }
+            wordlist = new_wl;
+            wordlist[wordcount] = strdup(tokens[*pos].value);
+            if (!wordlist[wordcount]) { perror("strdup"); exit(1); }
+            wordcount++;
             (*pos)++;
         }
     }
+
     if (*pos >= end || tokens[*pos].type != TOKEN_DO) {
-        fprintf(stderr, "parse error: expected 'do'\n");
+        fprintf(stderr, "parse error near token '%s': expected 'do'\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *body = parse_toplevel(tokens, pos, end);
+    ASTNode *body = parse_toplevel(tokens, pos, end, depth + 1);
     if (*pos >= end || tokens[*pos].type != TOKEN_DONE) {
-        fprintf(stderr, "parse error: expected 'done'\n");
+        fprintf(stderr, "parse error near token '%s': expected 'done'\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
     (*pos)++;
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = NODE_FOR;
-    node->data.for_stmt.var = var;
-    node->data.for_stmt.wordlist = wordlist;
-    node->data.for_stmt.wordcount = wordcount;
-    node->data.for_stmt.body = body;
+
+    ASTNode *node = new_for_node(var, wordcount, wordlist, body);
+    if (!node) { perror("new_for_node"); exit(1); }
     return node;
 }
 
-static ASTNode *parse_group(Token *tokens, int *pos, int end) {
-    (*pos)++;
-    ASTNode *body = parse_toplevel(tokens, pos, end);
-    if (*pos >= end || tokens[*pos].type != TOKEN_GROUP_CLOSE) {
-        fprintf(stderr, "parse error: expected ')'\n");
+ASTNode *parse_toplevel(Token *tokens, int *pos, int end, int depth) {
+    if (depth > MAX_PARSE_DEPTH) {
+        fprintf(stderr, "parse error near token '%s': input nested too deeply\n",
+                token_str_at(tokens, *pos, end));
         exit(1);
     }
-    (*pos)++;
-    ASTNode *node = malloc(sizeof(ASTNode));
-    node->type = NODE_GROUP;
-    node->data.group.body = body;
-    return node;
-}
 
-ASTNode *parse_toplevel(Token *tokens, int *pos, int end) {
     ASTNode *left = NULL;
+
     if (*pos >= end) return NULL;
-    if (tokens[*pos].type == TOKEN_IF) {
-        left = parse_if(tokens, pos, end);
-    } else if (tokens[*pos].type == TOKEN_WHILE) {
-        left = parse_while(tokens, pos, end);
-    } else if (tokens[*pos].type == TOKEN_FOR) {
-        left = parse_for(tokens, pos, end);
-    } else if (tokens[*pos].type == TOKEN_GROUP_OPEN) {
-        left = parse_group(tokens, pos, end);
+
+    TokenType start = tokens[*pos].type;
+    if (start == TOKEN_IF) {
+        left = parse_if(tokens, pos, end, depth + 1);
+    } else if (start == TOKEN_WHILE) {
+        left = parse_while(tokens, pos, end, depth + 1);
+    } else if (start == TOKEN_FOR) {
+        left = parse_for(tokens, pos, end, depth + 1);
     } else {
-        left = parse_pipeline(tokens, pos, end);
+        left = parse_pipeline(tokens, pos, end, depth + 1);
     }
+
     while (*pos < end) {
         TokenType op = tokens[*pos].type;
         if (op == TOKEN_AND || op == TOKEN_OR || op == TOKEN_SEMICOLON) {
             (*pos)++;
             ASTNode *right = NULL;
             if (*pos < end) {
-                if (tokens[*pos].type == TOKEN_IF) right = parse_if(tokens, pos, end);
-                else if (tokens[*pos].type == TOKEN_WHILE) right = parse_while(tokens, pos, end);
-                else if (tokens[*pos].type == TOKEN_FOR) right = parse_for(tokens, pos, end);
-                else if (tokens[*pos].type == TOKEN_GROUP_OPEN) right = parse_group(tokens, pos, end);
-                else right = parse_pipeline(tokens, pos, end);
+                right = parse_secondary(tokens, pos, end, depth + 1);
             }
-            ASTNode *node = malloc(sizeof(ASTNode));
-            node->type = (op == TOKEN_AND) ? NODE_AND : (op == TOKEN_OR) ? NODE_OR : NODE_SEMICOLON;
-            node->data.binary.left = left;
-            node->data.binary.right = right;
+            NodeType node_type = (op == TOKEN_AND) ? NODE_AND :
+                                 (op == TOKEN_OR)  ? NODE_OR  :
+                                                      NODE_SEMICOLON;
+            ASTNode *node = new_binary_node(node_type, left, right);
+            if (!node) { perror("new_binary_node"); exit(1); }
             left = node;
-        } else break;
+        } else {
+            break;
+        }
     }
+
     return left;
 }

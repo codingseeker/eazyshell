@@ -1,8 +1,9 @@
-#ifndef PARSER_H
+parser.h#ifndef PARSER_H
 #define PARSER_H
 
-#include "ast.h"
+#include "AST.h"
+#include "lexer.h"
 
-ASTNode *parse_toplevel(Token *tokens, int *pos, int end);
+ASTNode *parse(Token *tokens, int count);
 
 #endif
