@@ -1,24 +1,9 @@
 #ifndef AST_H
 #define AST_H
 
-#include "lexer.h"
+#include <stddef.h>
 
-typedef struct Command {
-    char **argv;
-    int argc;
-    int argv_cap;
-    char *infile;
-    char *outfile;
-    char *heredoc_delim;
-    int heredoc_fd;
-} Command;
-
-typedef struct Pipeline {
-    Command **cmds;
-    int count;
-} Pipeline;
-
-typedef enum {
+typedef enum NodeType {
     NODE_COMMAND,
     NODE_PIPELINE,
     NODE_AND,
@@ -27,38 +12,68 @@ typedef enum {
     NODE_IF,
     NODE_WHILE,
     NODE_FOR,
-    NODE_GROUP
+    NODE_SUBSHELL,
+    NODE_LIST,
+    NODE_FUNCTION,
+    NODE_CASE
 } NodeType;
 
-typedef struct ASTNode {
+typedef struct Command Command;
+typedef struct Pipeline Pipeline;
+typedef struct ASTNode ASTNode;
+
+struct Command {
+    size_t argc;
+    char **argv;
+    char *infile;
+    char *outfile;
+    int append_out;
+    char *heredoc_delim;
+    int heredoc_fd;
+};
+
+struct Pipeline {
+    size_t count;
+    ASTNode **nodes;
+};
+
+struct ASTNode {
     NodeType type;
     union {
         Command *cmd;
-        struct {
-            struct ASTNode *left;
-            struct ASTNode *right;
-        } binary;
         Pipeline *pipeline;
         struct {
-            struct ASTNode *condition;
-            struct ASTNode *then_body;
-            struct ASTNode *else_body;
+            ASTNode *left;
+            ASTNode *right;
+        } binary;
+        struct {
+            ASTNode *condition;
+            ASTNode *then_body;
+            ASTNode *else_body;
         } if_stmt;
         struct {
-            struct ASTNode *condition;
-            struct ASTNode *body;
+            ASTNode *condition;
+            ASTNode *body;
         } while_stmt;
         struct {
             char *var;
+            size_t word_count;
             char **wordlist;
-            int wordcount;
-            struct ASTNode *body;
+            ASTNode *body;
         } for_stmt;
         struct {
-            struct ASTNode *body;
-        } group;
+            ASTNode *body;
+        } subshell;
     } data;
-} ASTNode;
+};
+
+ASTNode *new_command_node(Command *cmd);
+ASTNode *new_pipeline_node(Pipeline *p);
+ASTNode *new_binary_node(NodeType type, ASTNode *left, ASTNode *right);
+ASTNode *new_if_node(ASTNode *cond, ASTNode *then_body, ASTNode *else_body);
+ASTNode *new_while_node(ASTNode *cond, ASTNode *body);
+ASTNode *new_for_node(char *var, size_t word_count, char **wordlist, ASTNode *body);
+ASTNode *new_subshell_node(ASTNode *body);
 
 void free_command(Command *cmd);
 void free_pipeline(Pipeline *p);
