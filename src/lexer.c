@@ -1,4 +1,4 @@
- #define _GNU_SOURCE
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +95,7 @@ static char *read_word(const char *line, int *pos, int line_len, int *col, int *
         }
         if (c == '"' && !in_squote) {
             in_dquote = !in_dquote;
+
             *quoted = 1;
             (*pos)++;
             (*col)++;
